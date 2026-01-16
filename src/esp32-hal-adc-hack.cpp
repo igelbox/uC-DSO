@@ -30,7 +30,7 @@ extern adc_handle_t adc_handle;
 #define ADC_GET_DATA(p_data) ((p_data)->type2.data)
 #endif
 
-uint16_t analogContinuousReadSamples(adc_continuous_samples_t &samples, uint32_t timeout_ms) {
+uint16_t analogContinuousReadSamples(uint16_t *samples, uint16_t count, uint32_t timeout_ms) {
   if (!adc_handle.adc_continuous_handle) {
     log_e("ADC Continuous is not initialized!");
     return 0;
@@ -46,12 +46,16 @@ uint16_t analogContinuousReadSamples(adc_continuous_samples_t &samples, uint32_t
     return 0;
   }
 
-  memset(samples, 0, sizeof(samples));
-  uint16_t result = 0;
+  if ((bytes_read / SOC_ADC_DIGI_RESULT_BYTES) > count) {
+    log_e("Insufficient buffer");
+    return 0;
+  }
+
+  size_t result = 0;
   for (int i = 0; i < bytes_read; i += SOC_ADC_DIGI_RESULT_BYTES) {
     const auto p = (adc_digi_output_data_t *)&adc_read[i];
     const auto chan_num = ADC_GET_CHANNEL(p);
-    const auto data = ADC_GET_DATA(p);
+    auto data = ADC_GET_DATA(p);
 
     if (chan_num >= SOC_ADC_CHANNEL_NUM(0)) {
       log_e("Invalid data [%d_%d]", chan_num, data);
@@ -60,7 +64,7 @@ uint16_t analogContinuousReadSamples(adc_continuous_samples_t &samples, uint32_t
 
     if (data >= (1 << SOC_ADC_DIGI_MAX_BITWIDTH)) {
       log_e("Invalid data");
-      continue;
+      data = 0xFFFF;
     }
 
     samples[result++] = data;

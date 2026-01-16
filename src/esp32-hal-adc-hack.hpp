@@ -3,5 +3,4 @@
 #include <cstdint>
 #include <soc/soc_caps.h>
 
-using adc_continuous_samples_t = uint16_t[4092 / SOC_ADC_DIGI_RESULT_BYTES];
-uint16_t analogContinuousReadSamples(adc_continuous_samples_t &samples, uint32_t timeout_ms);
+uint16_t analogContinuousReadSamples(uint16_t *samples, uint16_t count, uint32_t timeout_ms);

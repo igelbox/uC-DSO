@@ -11,19 +11,48 @@
 #include "serio.hpp"
 #include "tcp.hpp"
 
+#define MAX_CPP (4092u / SOC_ADC_DIGI_RESULT_BYTES)
+#define SAMPLES_COUNT 20000
+#define MAX_RATE SOC_ADC_SAMPLE_FREQ_THRES_HIGH
+static uint16_t samples[SAMPLES_COUNT + MAX_CPP], cursor = 0, upper = SAMPLES_COUNT;
+static size_t depth = 500, rate = MAX_RATE, nrate = rate;
+
+struct {
+  bool begin() {
+    uint8_t pin = 0;
+    const auto cpp = min((95 * rate) / 1000, MAX_CPP);
+    Serio << "adc: rate=" << rate << " cpp=" << cpp;
+    return CHECK(analogContinuous(&pin, 1, cpp, rate, nullptr)) //
+           && analogContinuousStart();
+  }
+  bool restart() {
+    return CHECK(analogContinuousStop())      //
+           && CHECK(analogContinuousDeinit()) //
+           && begin();
+  }
+} adc;
+
 template <typename R> using CommandHandler = R (*)(const char *args);
 std::initializer_list<std::pair<const char *, std::variant<                     //
+                                                  CommandHandler<std::string>,  //
                                                   CommandHandler<const char *>, //
                                                   CommandHandler<void>          //
                                                   >>>
     COMMANDS{
         {"*IDN?\n", [](const auto) { return "igelbox,EScoPe,1,0.1"; }},
-        {"RATES?\n", [](const auto) { return "83333,"; }},
-        {"DEPTHS?\n", [](const auto) { return "1023,"; }},
+        {"RATES?\n",
+         [](const auto) {
+           std::string result;
+           for (const auto interval : {30, 40, 50, 80, 100, 200, 250, 400, 500, 800, 1000, 2000, 2500, 4000}) {
+             const auto rate = 5'000'000 / 2 / interval;
+             result += std::to_string(rate) + ',';
+           }
+           return result;
+         }},
+        {"RATE ", [](const char *arg) { nrate = min((long long)MAX_RATE, atoll(arg)); }},
+        {"DEPTHS?\n", [](const auto) { return "500,1000,2000,4000,5000,10000,20000,"; }},
+        {"DEPTH ", [](const char *arg) { depth = atoll(arg); }},
     };
-
-static size_t current = 0;
-static adc_continuous_samples_t samples[4];
 
 struct ScopeClient : tcp::Client {
   std::string input;
@@ -39,14 +68,19 @@ protected:
 };
 
 void ScopeClient::handle_acquire() {
-  const auto count = sizeof(samples) / 2;
-
-  protocol::AcquireHeader header{0, 1, (uint64_t)1e15 / 83333, 0, 83333 / 1e6};
+  protocol::AcquireHeader header{0, 1, (uint64_t)1e15 / rate, 0, rate / 1e6};
   write((const char *)&header, sizeof(header));
 
+  const auto count = depth;
+  const auto cur = cursor;
   protocol::ChannelHeader channel{0, count, 0.750f / 4095.f, 0.f, (0.f), false};
   write((const char *)&channel, sizeof(channel));
-  write((const char *)samples, 2 * count);
+  if (const auto prev = count - cur; count > cur) {
+    write((const char *)&samples[upper - prev], 2 * prev);
+    write((const char *)&samples[0], 2 * cur);
+  } else {
+    write((const char *)&samples[cur - count], 2 * count);
+  }
 }
 
 void ScopeClient::handle_command(const char *command) {
@@ -56,8 +90,10 @@ void ScopeClient::handle_command(const char *command) {
         const char *const args;
         ScopeClient &client;
         void operator()(const CommandHandler<void> &handler) const { handler(args); }
-        void operator()(const CommandHandler<const char *> &handler) const {
-          client.write(handler(args));
+        void operator()(const CommandHandler<const char *> &handler) const { reponse(handler(args)); }
+        void operator()(const CommandHandler<std::string> &handler) const { reponse(handler(args).c_str()); }
+        void reponse(const char *response) const {
+          client.write(response);
           static const char N{'\n'};
           client.write(&N, 1);
         }
@@ -78,9 +114,8 @@ void setup() {
   delay(500);             // give a time to connect monitor
   Serial.begin(115200);
 
-  uint8_t pin = 0;
-  ASSERT(analogContinuous(&pin, 1, 4092 / SOC_ADC_DIGI_RESULT_BYTES, 83333, nullptr));
-  ASSERT(analogContinuousStart());
+  analogContinuousSetAtten(ADC_0db);
+  ASSERT(adc.begin());
 
   {
     auto log = Serio << "Connecting to " << WIFI_SSID << ": ";
@@ -102,7 +137,21 @@ void setup() {
   Serio << "Server started :" << server._port;
 }
 
+auto last_report = millis();
 void loop() {
-  Serial.print(analogContinuousReadSamples(samples[current], 100) == 1023 ? '.' : '!');
-  current = (current + 1) % 4;
+  const auto time = millis();
+  if ((time - last_report) > 5000) {
+    last_report = time;
+    Serio << "heap=" << (100 * ESP.getFreeHeap() / ESP.getHeapSize()) << '%' << (ESP.getFreeHeap() / 1024) << 'k'
+          << (ESP.getMinFreeHeap() / 1024);
+  }
+
+  if (rate != nrate) {
+    rate = nrate;
+    CHECK(adc.restart());
+  }
+  if (cursor += analogContinuousReadSamples(samples + cursor, MAX_CPP, 100); cursor > SAMPLES_COUNT) {
+    upper = cursor;
+    cursor = 0;
+  }
 }
