@@ -97,6 +97,7 @@ void setup() {
   Serio << "mDNS started";
 
   server.onClient(tcp::onClient<ScopeClient>, nullptr);
+  server.setNoDelay(true);
   server.begin();
   Serio << "Server started :" << server._port;
 }
