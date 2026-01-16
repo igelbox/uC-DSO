@@ -1,5 +1,6 @@
+#include <variant>
+
 #include <Arduino.h>
-#include <AsyncTCP.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
 
@@ -8,8 +9,7 @@
 #include "esp32-hal-adc-hack.hpp"
 #include "protocol.hpp"
 #include "serio.hpp"
-
-#include <variant>
+#include "tcp.hpp"
 
 template <typename R> using CommandHandler = R (*)(const char *args);
 std::initializer_list<std::pair<const char *, std::variant<                     //
@@ -25,35 +25,36 @@ std::initializer_list<std::pair<const char *, std::variant<                     
 static size_t current = 0;
 static adc_continuous_samples_t samples[4];
 
-void client_write(AsyncClient &client, const char *data, size_t size) {
-  for (;;) {
-    const auto r = client.write(data, size);
-    size -= r;
-    if (!size)
-      break;
-    delay(10);
-    Serial.printf(":%d", r);
-    data += r;
+struct ScopeClient : tcp::Client {
+  std::string input;
+  ScopeClient(AsyncClient &async) : tcp::Client(async) {}
+  void data(void *data, size_t size) {
+    input.append((const char *)data, size);
+    protocol::handle(input, [&]() { handle_acquire(); }, [&](const auto &cmd) { handle_command(cmd); });
   }
-}
 
-void handle_acquire(AsyncClient &client) {
+protected:
+  void handle_acquire();
+  void handle_command(const char *command);
+};
+
+void ScopeClient::handle_acquire() {
   const auto count = sizeof(samples) / 2;
 
   protocol::AcquireHeader header{0, 1, (uint64_t)1e15 / 83333, 0, 83333 / 1e6};
-  client_write(client, (const char *)&header, sizeof(header));
+  write((const char *)&header, sizeof(header));
 
   protocol::ChannelHeader channel{0, count, 0.750f / 4095.f, 0.f, (0.f), false};
-  client_write(client, (const char *)&channel, sizeof(channel));
-  client_write(client, (const char *)samples, 2 * count);
+  write((const char *)&channel, sizeof(channel));
+  write((const char *)samples, 2 * count);
 }
 
-void handle_command(AsyncClient &client, const char *command) {
+void ScopeClient::handle_command(const char *command) {
   for (const auto &[prefix, handler] : COMMANDS) {
     if (const auto offset = scpi::match_args_offset(prefix, strlen(prefix), command)) {
       struct Visitor {
         const char *const args;
-        AsyncClient &client;
+        ScopeClient &client;
         void operator()(const CommandHandler<void> &handler) const { handler(args); }
         void operator()(const CommandHandler<const char *> &handler) const {
           client.write(handler(args));
@@ -61,7 +62,7 @@ void handle_command(AsyncClient &client, const char *command) {
           client.write(&N, 1);
         }
       };
-      std::visit(Visitor{command + offset, client}, handler);
+      std::visit(Visitor{command + offset, *this}, handler);
       return;
     }
   }
@@ -95,44 +96,7 @@ void setup() {
   CHECK(MDNS.begin("escope"));
   Serio << "mDNS started";
 
-  server.onClient(
-      [](void *arg, AsyncClient *client) {
-        Serio << "connected: " << (void *)client << ' ' << client->remoteIP() << ':' << client->remotePort();
-        using Buffer = std::string;
-        const auto buffer = new Buffer();
-        try {
-          client->onDisconnect(
-              [](void *arg, AsyncClient *client) {
-                Serio << "disconnected: " << (void *)client;
-                delete (Buffer *)arg;
-                delete client;
-              },
-              (void *)buffer);
-        } catch (...) {
-          delete buffer;
-          throw;
-        }
-        client->onData(
-            [](void *arg, AsyncClient *client, void *data, size_t len) {
-              // Serio << "received " << (void *)client << ' ' << data << ' ' << len;
-              const auto chars = (const char *)data;
-              auto &buffer = *(Buffer *)arg;
-              buffer.append(chars, len);
-
-              protocol::handle(
-                  buffer, [&]() { handle_acquire(*client); },
-                  [&](const auto &command) { handle_command(*client, command); });
-              if (!buffer.empty()) {
-                Serio << "buffer: " << buffer;
-              }
-            },
-            (void *)buffer);
-        client->onError(
-            [](void *arg, AsyncClient *client, int8_t error) { Serio << "errored " << (void *)client << ' ' << error; },
-            nullptr);
-      },
-      nullptr);
-
+  server.onClient(tcp::onClient<ScopeClient>, nullptr);
   server.begin();
   Serio << "Server started :" << server._port;
 }
