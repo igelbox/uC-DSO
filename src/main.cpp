@@ -10,12 +10,15 @@
 #include "protocol.hpp"
 #include "serio.hpp"
 #include "tcp.hpp"
+#include "triggers.hpp"
 
 #define MAX_CPP (4092u / SOC_ADC_DIGI_RESULT_BYTES)
 #define SAMPLES_COUNT 20000
 #define MAX_RATE SOC_ADC_SAMPLE_FREQ_THRES_HIGH
 static uint16_t samples[SAMPLES_COUNT + MAX_CPP], cursor = 0, upper = SAMPLES_COUNT;
-static size_t depth = 500, rate = MAX_RATE, nrate = rate;
+static uint16_t depth = 500;
+static size_t rate = MAX_RATE, nrate = rate;
+static float trig_level = 0;
 
 struct {
   bool begin() {
@@ -52,6 +55,7 @@ std::initializer_list<std::pair<const char *, std::variant<                     
         {"RATE ", [](const char *arg) { nrate = min((long long)MAX_RATE, atoll(arg)); }},
         {"DEPTHS?\n", [](const auto) { return "500,1000,2000,4000,5000,10000,20000,"; }},
         {"DEPTH ", [](const char *arg) { depth = atoll(arg); }},
+        {"TRIG:LEV ", [](const char *arg) { trig_level = atoff(arg); }},
     };
 
 struct ScopeClient : tcp::Client {
@@ -73,14 +77,24 @@ void ScopeClient::handle_acquire() {
 
   const auto count = depth;
   const auto cur = cursor;
-  protocol::ChannelHeader channel{0, count, 0.750f / 4095.f, 0.f, (0.f), false};
-  write((const char *)&channel, sizeof(channel));
+  uint16_t *a, as, *b, bs;
   if (const auto prev = count - cur; count > cur) {
-    write((const char *)&samples[upper - prev], 2 * prev);
-    write((const char *)&samples[0], 2 * cur);
+    a = &samples[upper - prev], as = prev;
+    b = &samples[0], bs = cur;
   } else {
-    write((const char *)&samples[cur - count], 2 * count);
+    a = &samples[cur - count], as = count;
+    bs = 0;
   }
+  static const auto scale = 0.750f / 4095.f;
+  triggers::Rising<uint16_t, uint16_t> trigger((int)constrain(trig_level / scale, 0, 4095), *a);
+  if (!trigger.process(a, as, 0))
+    trigger.process(b, bs, as);
+
+  protocol::ChannelHeader channel{0, count, scale, 0.f, -1e15f * trigger.index / rate, false};
+  write((const char *)&channel, sizeof(channel));
+  write((const char *)a, 2 * as);
+  if (bs)
+    write((const char *)b, 2 * bs);
 }
 
 void ScopeClient::handle_command(const char *command) {
