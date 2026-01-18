@@ -15,17 +15,39 @@
 #define MAX_CPP (4092u / SOC_ADC_DIGI_RESULT_BYTES)
 #define SAMPLES_COUNT 20000
 #define MAX_RATE SOC_ADC_SAMPLE_FREQ_THRES_HIGH
-static uint16_t samples[SAMPLES_COUNT + MAX_CPP], cursor = 0, upper = SAMPLES_COUNT;
+static const uint64_t FEMTOS = 1e15;
+
+static uint16_t samples[SAMPLES_COUNT + MAX_CPP];
+struct {
+  uint16_t cursor = 0;
+  uint16_t upper = SAMPLES_COUNT;
+} loop_thread_vars;
+
 static uint16_t depth = 500;
-static size_t rate = MAX_RATE, nrate = rate;
 static float trig_level = 0;
+static uint8_t trig_sou = 0;
+
+struct Config {
+  static constexpr uint8_t PINS[] = {0, 1, 3, 4}; // pin 2 is pulled up whatever I do
+  size_t rate = MAX_RATE;
+  uint8_t enabled = 0x01;
+  bool is_enabled(uint8_t index) const { return enabled & (1 << index); }
+  void set_enabled(uint8_t index, bool value) { enabled = value ? enabled | (1 << index) : enabled & ~(1 << index); }
+  auto operator<=>(const Config &) const = default;
+} config, nconfig = config;
 
 struct {
   bool begin() {
-    uint8_t pin = 0;
-    const auto cpp = min((95 * rate) / 1000, MAX_CPP);
-    Serio << "adc: rate=" << rate << " cpp=" << cpp;
-    return CHECK(analogContinuous(&pin, 1, cpp, rate, nullptr)) //
+    uint8_t pins[sizeof(Config::PINS)];
+    size_t count = 0;
+    for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
+      if (config.is_enabled(i)) {
+        pins[count++] = Config::PINS[i];
+      }
+    }
+    const auto cpp = min((95 * config.rate) / 1000, MAX_CPP);
+    Serio << "adc: rate=" << config.rate << " count=" << count << " cpp=" << cpp;
+    return CHECK(analogContinuous(pins, count, cpp / count, config.rate, nullptr)) //
            && analogContinuousStart();
   }
   bool restart() {
@@ -52,10 +74,23 @@ std::initializer_list<std::pair<const char *, std::variant<                     
            }
            return result;
          }},
-        {"RATE ", [](const char *arg) { nrate = min((long long)MAX_RATE, atoll(arg)); }},
+        {"RATE ", [](const char *arg) { nconfig.rate = min((long long)MAX_RATE, atoll(arg)); }},
         {"DEPTHS?\n", [](const auto) { return "500,1000,2000,4000,5000,10000,20000,"; }},
         {"DEPTH ", [](const char *arg) { depth = atoll(arg); }},
         {"TRIG:LEV ", [](const char *arg) { trig_level = atoff(arg); }},
+        {"TRIG:SOU CHAN", [](const char *arg) { trig_sou = *arg - '1'; }},
+        {":CHAN",
+         [](const auto *arg) {
+           auto c = arg;
+           const auto index = *c++ - '1';
+           if (!CHECK_VA(*c++ == ':', arg))
+             return;
+           if (const auto on = strcmp(c, "ON") == 0; on || (strcmp(c, "OFF") == 0)) {
+             nconfig.set_enabled(index, on);
+           } else {
+             Serio << ":CHAN" << arg;
+           }
+         }},
     };
 
 struct ScopeClient : tcp::Client {
@@ -67,34 +102,71 @@ struct ScopeClient : tcp::Client {
   }
 
 protected:
+  uint32_t seqnum = 0;
   void handle_acquire();
   void handle_command(const char *command);
 };
 
+template <typename T> auto sacpy(T *dst, const T *src, size_t count, size_t stride) {
+  for (; count; --count) {
+    *dst++ = *src;
+    src += stride;
+  }
+  return dst;
+}
+
 void ScopeClient::handle_acquire() {
-  protocol::AcquireHeader header{0, 1, (uint64_t)1e15 / rate, 0, rate / 1e6};
+  uint8_t toffs = 0, nchan = 0;
+  for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
+    if (config.is_enabled(i)) {
+      if (i == trig_sou) {
+        toffs = nchan;
+      }
+      ++nchan;
+    }
+  }
+  // Serio << "nc=" << nchan << " to=" << toffs;
+  output.reserve(sizeof(protocol::AcquireHeader)           //
+                 + nchan * sizeof(protocol::ChannelHeader) //
+                 + depth * 2);
+  const auto icap = output.capacity();
+  protocol::AcquireHeader header{seqnum++, nchan, FEMTOS * nchan / config.rate, 0, config.rate / 1e6 / nchan};
   write((const char *)&header, sizeof(header));
 
-  const auto count = depth;
-  const auto cur = cursor;
-  uint16_t *a, as, *b, bs;
-  if (const auto prev = count - cur; count > cur) {
-    a = &samples[upper - prev], as = prev;
-    b = &samples[0], bs = cur;
+  const auto [cursor, upper] = loop_thread_vars; // stable copy
+  // Serio << depth << '/' << cursor << '/' << upper;
+  const uint16_t cdepth = depth / nchan, tsize = cdepth * nchan;
+  // Serio << cdepth << '/' << tsize;
+  uint16_t *a, asize, *b, bsize;
+  if (const auto prev = tsize - cursor; tsize > cursor) {
+    a = &samples[upper - prev], asize = prev / nchan;
+    b = &samples[0], bsize = cursor / nchan;
   } else {
-    a = &samples[cur - count], as = count;
-    bs = 0;
+    a = &samples[cursor - tsize], asize = tsize / nchan;
+    bsize = 0;
   }
+  // Serio << "as=" << asize << " bs=" << bsize;
   static const auto scale = 0.750f / 4095.f;
-  triggers::Rising<uint16_t, uint16_t> trigger((int)constrain(trig_level / scale, 0, 4095), *a);
-  if (!trigger.process(a, as, 0))
-    trigger.process(b, bs, as);
+  triggers::Rising<uint16_t, uint16_t> trigger(constrain(trig_level / scale, 0, 4095), *(a + toffs), nchan);
+  if (!trigger.process(a + toffs, asize, 0))
+    trigger.process(b + toffs, bsize, asize);
+  // Serio << "tl=" << trigger.level << " ti=" << trigger.index;
 
-  protocol::ChannelHeader channel{0, count, scale, 0.f, -1e15f * trigger.index / rate, false};
-  write((const char *)&channel, sizeof(channel));
-  write((const char *)a, 2 * as);
-  if (bs)
-    write((const char *)b, 2 * bs);
+  uint8_t coffset = 0;
+  for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
+    if (config.is_enabled(i)) {
+      protocol::ChannelHeader channel{i, cdepth, scale, 0.f, -1e15f * trigger.index / config.rate * nchan, false};
+      write((const char *)&channel, sizeof(channel));
+
+      auto data = (uint16_t *)advance(channel.memdepth * 2);
+      // Serio << "oc=" << output.capacity() << " he=" << (ESP.getFreeHeap() / 1024) << 'k';
+      data = sacpy(data, a + coffset, asize, nchan);
+      data = sacpy(data, b + coffset, bsize, nchan);
+      ++coffset;
+    }
+  }
+  CHECK_VA(output.capacity() == icap, "%d,%d", output.capacity(), icap);
+  flush();
 }
 
 void ScopeClient::handle_command(const char *command) {
@@ -160,10 +232,11 @@ void loop() {
           << (ESP.getMinFreeHeap() / 1024);
   }
 
-  if (rate != nrate) {
-    rate = nrate;
+  if (config != nconfig) {
+    config = nconfig;
     CHECK(adc.restart());
   }
+  auto &[cursor, upper] = loop_thread_vars;
   if (cursor += analogContinuousReadSamples(samples + cursor, MAX_CPP, 100); cursor > SAMPLES_COUNT) {
     upper = cursor;
     cursor = 0;
