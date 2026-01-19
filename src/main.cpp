@@ -146,7 +146,7 @@ void ScopeClient::handle_acquire() {
     bsize = 0;
   }
   // Serio << "as=" << asize << " bs=" << bsize;
-  static const auto scale = 0.750f / 4095.f;
+  static const auto scale = 1e-3f;
   triggers::Rising<uint16_t, uint16_t> trigger(constrain(trig_level / scale, 0, 4095), *(a + toffs), nchan);
   if (!trigger.process(a + toffs, asize, 0))
     trigger.process(b + toffs, bsize, asize);

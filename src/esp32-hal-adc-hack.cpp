@@ -13,7 +13,7 @@ typedef struct {
   adc_oneshot_unit_handle_t _;
   adc_continuous_handle_t adc_continuous_handle;
   interrupt_config_t _;
-  adc_cali_handle_t _;
+  adc_cali_handle_t adc_cali_handle;
   uint32_t _;
   uint32_t conversion_frame_size;
 } adc_handle_t;
@@ -67,6 +67,8 @@ uint16_t analogContinuousReadSamples(uint16_t *samples, uint16_t count, uint32_t
       data = 0xFFFF;
     }
 
+    int mvolts;
+    data = adc_cali_raw_to_voltage(adc_handle.adc_cali_handle, data, &mvolts) == ESP_OK ? mvolts : 0xFFFE;
     samples[result++] = data;
   }
   return result;
