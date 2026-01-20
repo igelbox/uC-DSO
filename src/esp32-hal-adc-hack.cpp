@@ -73,3 +73,24 @@ uint16_t analogContinuousReadSamples(uint16_t *samples, uint16_t count, uint32_t
   }
   return result;
 }
+
+bool analogSampleToMVolts(uint16_t sample, uint16_t &mvolts) {
+  int buffer;
+  return adc_cali_raw_to_voltage(adc_handle.adc_cali_handle, sample, &buffer) == ESP_OK ? mvolts = buffer, true : false;
+}
+
+bool analogContinuousDeinitFix() {
+  if (adc_handle.adc_cali_handle) {
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (adc_cali_delete_scheme_curve_fitting(adc_handle.adc_cali_handle) != ESP_OK) {
+      return false;
+    }
+#elif (!defined(CONFIG_IDF_TARGET_ESP32H2) && !defined(CONFIG_IDF_TARGET_ESP32P4))
+    if (adc_cali_delete_scheme_line_fitting(adc_handle.adc_cali_handle) != ESP_OK) {
+      return false;
+    }
+#endif
+  }
+  adc_handle.adc_cali_handle = nullptr;
+  return true;
+}

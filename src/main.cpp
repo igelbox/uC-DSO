@@ -30,14 +30,56 @@ static uint8_t trig_sou = 0;
 struct Config {
   static constexpr uint8_t PINS[] = {0, 1, 3, 4}; // pin 2 is pulled up whatever I do
   size_t rate = MAX_RATE;
+  adc_attenuation_t atten = ADC_0db;
   uint8_t enabled = 0x01;
   bool is_enabled(uint8_t index) const { return enabled & (1 << index); }
   void set_enabled(uint8_t index, bool value) { enabled = value ? enabled | (1 << index) : enabled & ~(1 << index); }
   auto operator<=>(const Config &) const = default;
 } config, nconfig = config;
 
+static float ranges[sizeof(Config::PINS)] = {5.f};
+static float offsets[sizeof(Config::PINS)] = {0.f};
+
+using Range = std::pair<adc_attenuation_t, float>;
+static std::array<Range, ADC_ATTENDB_MAX> RANGES{
+    Range{ADC_0db, 0.f /*uninitialized*/},
+    Range{ADC_2_5db, 0.f},
+    Range{ADC_6db, 0.f},
+    Range{ADC_11db, 0.f},
+};
+auto recalc_atten(const Config &config) {
+  float top = 0.f;
+  for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
+    if (config.is_enabled(i)) {
+      top = std::max(top, ranges[i] / 2.f + offsets[i]);
+    }
+  }
+  adc_attenuation_t result;
+  for (const auto &[atten, max] : RANGES) {
+    result = atten;
+    if (max >= top) {
+      break;
+    }
+  }
+  return result;
+}
 struct {
   bool begin() {
+    auto log = Serio << "att:";
+    for (auto &[atten, max] : RANGES) {
+      analogContinuousSetAtten(atten);
+      uint16_t mvolts;
+      if (!(CHECK(analogContinuous(Config::PINS, 1, 64, config.rate, nullptr)) &&
+            CHECK(analogSampleToMVolts((1 << SOC_ADC_DIGI_MAX_BITWIDTH) - 1, mvolts)) //
+            && CHECK(analogContinuousDeinit()) && CHECK(analogContinuousDeinitFix()))) {
+        return false;
+      }
+      max = mvolts / 1e3;
+      log << ' ' << atten << '=' << max;
+    }
+    return true;
+  }
+  bool start() {
     uint8_t pins[sizeof(Config::PINS)];
     size_t count = 0;
     for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
@@ -45,15 +87,16 @@ struct {
         pins[count++] = Config::PINS[i];
       }
     }
+    analogContinuousSetAtten(config.atten);
     const auto cpp = min((95 * config.rate) / 1000, MAX_CPP);
-    Serio << "adc: rate=" << config.rate << " count=" << count << " cpp=" << cpp;
+    Serio << "adc: rate=" << config.rate << " count=" << count << " cpp=" << cpp << " att=" << config.atten;
     return CHECK(analogContinuous(pins, count, cpp / count, config.rate, nullptr)) //
            && analogContinuousStart();
   }
   bool restart() {
     return CHECK(analogContinuousStop())      //
            && CHECK(analogContinuousDeinit()) //
-           && begin();
+           && CHECK(analogContinuousDeinitFix()) && start();
   }
 } adc;
 
@@ -87,9 +130,14 @@ std::initializer_list<std::pair<const char *, std::variant<                     
              return;
            if (const auto on = strcmp(c, "ON") == 0; on || (strcmp(c, "OFF") == 0)) {
              nconfig.set_enabled(index, on);
+           } else if (strncmp(c, "RANGE ", 6) == 0) {
+             ranges[index] = atoff(c + 6);
+           } else if (strncmp(c, "OFFS ", 5) == 0) {
+             offsets[index] = atoff(c + 5);
            } else {
              Serio << ":CHAN" << arg;
            }
+           nconfig.atten = recalc_atten(nconfig);
          }},
     };
 
@@ -200,8 +248,8 @@ void setup() {
   delay(500);             // give a time to connect monitor
   Serial.begin(115200);
 
-  analogContinuousSetAtten(ADC_0db);
   ASSERT(adc.begin());
+  ASSERT(adc.start());
 
   {
     auto log = Serio << "Connecting to " << WIFI_SSID << ": ";
