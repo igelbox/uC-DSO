@@ -24,6 +24,7 @@ struct {
 } loop_thread_vars;
 
 static uint16_t depth = 500;
+static triggers::Direction trig_dir = triggers::Direction::kRising;
 static float trig_level = 0;
 static uint8_t trig_sou = 0;
 
@@ -122,6 +123,18 @@ std::initializer_list<std::pair<const char *, std::variant<                     
         {"DEPTH ", [](const char *arg) { depth = atoll(arg); }},
         {"TRIG:LEV ", [](const char *arg) { trig_level = atoff(arg); }},
         {"TRIG:SOU CHAN", [](const char *arg) { trig_sou = *arg - '1'; }},
+        {"TRIG:EDGE:DIR ",
+         [](const char *arg) {
+           if (strcmp(arg, "RISING") == 0) {
+             trig_dir = triggers::Direction::kRising;
+           } else if (strcmp(arg, "FALLING") == 0) {
+             trig_dir = triggers::Direction::kFalling;
+           } else if (strcmp(arg, "ANY") == 0) {
+             trig_dir = triggers::Direction::kAny;
+           } else {
+             Serio << "TRIG:EDGE:DIR " << arg;
+           }
+         }},
         {":CHAN",
          [](const auto *arg) {
            auto c = arg;
@@ -195,7 +208,7 @@ void ScopeClient::handle_acquire() {
   }
   // Serio << "as=" << asize << " bs=" << bsize;
   static const auto scale = 1e-3f;
-  triggers::Rising<uint16_t, uint16_t> trigger(constrain(trig_level / scale, 0, 4095), *(a + toffs), nchan);
+  triggers::Edge<uint16_t, uint16_t> trigger(trig_dir, constrain(trig_level / scale, 0, 4095), *(a + toffs), nchan);
   if (!trigger.process(a + toffs, asize, 0))
     trigger.process(b + toffs, bsize, asize);
   // Serio << "tl=" << trigger.level << " ti=" << trigger.index;
