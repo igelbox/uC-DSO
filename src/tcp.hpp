@@ -9,11 +9,12 @@ namespace {
 SerIO &operator<<(SerIO &serio, AsyncClient *value) { return serio << (void *)value; }
 } // namespace
 
-struct Client {
-  Client(AsyncClient &async) : async(async) {}
+template <typename WriterType> struct Client {
+  using Writer = WriterType;
+  Client(Writer &writer) : writer(writer) {}
 
 protected:
-  AsyncClient &async;
+  Writer &writer;
   std::string output;
 
   char *advance(size_t size) {
@@ -24,20 +25,22 @@ protected:
   void write(const char *data, size_t size) {
     if (!output.empty()) {
       output.append(data, size);
-    } else if (const auto written = async.write(data, size); written != size) {
+    } else if (const auto written = writer.write(data, size); written != size) {
       output.append(data + written, size - written);
     }
   }
   void write(const char *data) { write(data, strlen(data)); }
-  void flush() {
+
+public:
+  bool flush() {
     if (!output.empty()) {
-      if (const auto written = async.write(output.data(), output.size())) {
+      if (const auto written = writer.write(output.data(), output.size())) {
         output.erase(0, written);
+        return true;
       }
     }
+    return false;
   }
-
-  template <typename Client> friend void onClient(void *, AsyncClient *);
 };
 
 template <typename Client> void onClient(void *, AsyncClient *async) {

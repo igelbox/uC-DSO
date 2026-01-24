@@ -1,9 +1,11 @@
+#include <optional>
 #include <variant>
 
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
 
+#define SERIO_IMPLEMENTATION
 #include ".config.hpp"
 #include "assert.hpp"
 #include "esp32-hal-adc-hack.hpp"
@@ -154,9 +156,10 @@ std::initializer_list<std::pair<const char *, std::variant<                     
          }},
     };
 
-struct ScopeClient : tcp::Client {
+template <typename Writer> struct ScopeClient : tcp::Client<Writer> {
+  using Base = tcp::Client<Writer>;
   std::string input;
-  ScopeClient(AsyncClient &async) : tcp::Client(async) {}
+  ScopeClient(Writer &writer) : Base(writer) {}
   void data(void *data, size_t size) {
     input.append((const char *)data, size);
     protocol::handle(input, [&]() { handle_acquire(); }, [&](const auto &cmd) { handle_command(cmd); });
@@ -176,7 +179,7 @@ template <typename T> auto sacpy(T *dst, const T *src, size_t count, size_t stri
   return dst;
 }
 
-void ScopeClient::handle_acquire() {
+template <typename Writer> void ScopeClient<Writer>::handle_acquire() {
   uint8_t toffs = 0, nchan = 0;
   for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
     if (config.is_enabled(i)) {
@@ -187,12 +190,12 @@ void ScopeClient::handle_acquire() {
     }
   }
   // Serio << "nc=" << nchan << " to=" << toffs;
-  output.reserve(sizeof(protocol::AcquireHeader)           //
-                 + nchan * sizeof(protocol::ChannelHeader) //
-                 + depth * 2);
-  const auto icap = output.capacity();
+  Base::output.reserve(sizeof(protocol::AcquireHeader)           //
+                       + nchan * sizeof(protocol::ChannelHeader) //
+                       + depth * 2);
+  const auto icap = Base::output.capacity();
   protocol::AcquireHeader header{seqnum++, nchan, FEMTOS * nchan / config.rate, 0, config.rate / 1e6 / nchan};
-  write((const char *)&header, sizeof(header));
+  Base::write((const char *)&header, sizeof(header));
 
   const auto [cursor, upper] = loop_thread_vars; // stable copy
   // Serio << depth << '/' << cursor << '/' << upper;
@@ -217,20 +220,20 @@ void ScopeClient::handle_acquire() {
   for (uint8_t i = 0; i < sizeof(Config::PINS); ++i) {
     if (config.is_enabled(i)) {
       protocol::ChannelHeader channel{i, cdepth, scale, 0.f, -1e15f * trigger.index / config.rate * nchan, false};
-      write((const char *)&channel, sizeof(channel));
+      Base::write((const char *)&channel, sizeof(channel));
 
-      auto data = (uint16_t *)advance(channel.memdepth * 2);
+      auto data = (uint16_t *)Base::advance(channel.memdepth * 2);
       // Serio << "oc=" << output.capacity() << " he=" << (ESP.getFreeHeap() / 1024) << 'k';
       data = sacpy(data, a + coffset, asize, nchan);
       data = sacpy(data, b + coffset, bsize, nchan);
       ++coffset;
     }
   }
-  CHECK_VA(output.capacity() == icap, "%d,%d", output.capacity(), icap);
-  flush();
+  CHECK_VA(Base::output.capacity() == icap, "%d,%d", Base::output.capacity(), icap);
+  Base::flush();
 }
 
-void ScopeClient::handle_command(const char *command) {
+template <typename Writer> void ScopeClient<Writer>::handle_command(const char *command) {
   for (const auto &[prefix, handler] : COMMANDS) {
     if (const auto offset = scpi::match_args_offset(prefix, strlen(prefix), command)) {
       struct Visitor {
@@ -278,14 +281,28 @@ void setup() {
   CHECK(MDNS.begin("escope"));
   Serio << "mDNS started";
 
-  server.onClient(tcp::onClient<ScopeClient>, nullptr);
+  server.onClient(tcp::onClient<ScopeClient<AsyncClient>>, nullptr);
   server.setNoDelay(true);
   server.begin();
   Serio << "Server started :" << server._port;
 }
 
+struct SerialScopeClient : ScopeClient<decltype(Serial)> {
+  SerialScopeClient(Writer &writer) : ScopeClient<Writer>(writer) {
+    SerIO::prelude = [](SerIO &log) { log << "// "; };
+    server.end();
+    MDNS.end();
+    CHECK(WiFi.disconnect(true, true));
+  }
+};
+std::optional<SerialScopeClient> slient;
 auto last_report = millis();
 void loop() {
+  if (Serial.available()) {
+    auto &client = slient ? *slient : slient.emplace(Serial);
+    char buffer[1024];
+    client.data(buffer, Serial.readBytes(buffer, sizeof(buffer)));
+  }
   const auto time = millis();
   if ((time - last_report) > 5000) {
     last_report = time;

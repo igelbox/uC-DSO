@@ -3,8 +3,10 @@
 #include <HardwareSerial.h>
 
 struct SerIO {
-  SerIO() {}
-  SerIO(SerIO &from) { from.hollow = true; }
+  using Prelude = void (*)(SerIO &);
+  static Prelude prelude;
+  SerIO() { prelude && (prelude(*this), true); }
+  SerIO(SerIO &from) : SerIO() { from.hollow = true; }
   ~SerIO() {
     if (!hollow)
       Serial.println();
@@ -30,3 +32,7 @@ template <typename T> SerIO &operator<<(SerIO &serio, const T &printable) {
   Serial.print(printable);
   return serio;
 }
+
+#ifdef SERIO_IMPLEMENTATION
+SerIO::Prelude SerIO::prelude = nullptr;
+#endif
